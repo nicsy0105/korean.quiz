@@ -9,6 +9,17 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
+  /* 옛한글 전용 글꼴 — 함초롬바탕(HCR Batang)에서 자모만 추려 낸 것.
+     unicode-range 덕분에 옛 자모가 있는 자리에만 쓰이고,
+     나머지 글자는 아래 본문 글꼴이 그대로 담당합니다. */
+  @font-face{
+    font-family:"OldHangul";
+    src:url("old-hangul.woff2") format("woff2");
+    unicode-range:U+1100-11FF, U+A960-A97F, U+D7B0-D7FF,
+                  U+317F, U+3178, U+3181, U+3186, U+318D;
+    font-display:swap;
+  }
+
   :root{
     --ink:#17212b;
     --ink-soft:#4d5764;
@@ -18,8 +29,8 @@
     --line:#d5d2c7;
     --jusa:#9e2b25;
     --jjok:#2f5480;
-    --serif:"Gowun Batang", serif;
-    --sans:"Noto Sans KR", system-ui, sans-serif;
+    --serif:"OldHangul", "Gowun Batang", serif;
+    --sans:"OldHangul", "Noto Sans KR", system-ui, sans-serif;
   }
 
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -287,6 +298,16 @@
   }
   .review .body b{color:var(--ink);font-weight:500}
 
+  .send{
+    margin:1.75rem 0 0;
+    padding-left:.9rem;
+    border-left:2px solid var(--line);
+    font-size:.88rem;
+    color:var(--ink-soft);
+  }
+  .send.ok{border-color:var(--jjok)}
+  .send.bad{border-color:var(--jusa);color:var(--jusa)}
+
   .actions{display:flex;gap:.55rem;margin-top:2rem}
   .ghost{
     flex:1;
@@ -335,7 +356,10 @@
       <span>예상 시간<b id="mTime">8분</b></span>
     </div>
 
-    <label for="name">이름 (결과 제출용, 생략 가능)</label>
+    <label for="klass">반</label>
+    <input type="text" id="klass" placeholder="예) 중3 목요일반" autocomplete="off">
+
+    <label for="name">이름</label>
     <input type="text" id="name" placeholder="예) 김민서" autocomplete="off">
 
     <button class="primary" id="start">퀴즈 시작</button>
@@ -365,7 +389,10 @@
     <div class="score"><span id="scoreNum">0</span><small>/100</small></div>
     <p class="score-note" id="summary"></p>
     <div class="review" id="review"></div>
+    <p class="send" id="sendNote" hidden></p>
+
     <div class="actions">
+      <button class="ghost" id="resend" hidden>다시 제출</button>
       <button class="ghost" id="copy">결과 복사</button>
       <button class="ghost" id="again">다시 풀기</button>
     </div>
@@ -685,6 +712,15 @@ const ADVANCED = [
    ──────────────────────────────────────────────── */
 const SHUFFLE = true;
 
+/* ────────────────────────────────────────────────
+   성취도 수집 주소
+   구글 Apps Script 웹 앱 URL을 따옴표 안에 넣으면
+   학생이 퀴즈를 마칠 때 결과가 자동으로 시트에 쌓입니다.
+   비워 두면 전송 없이 '결과 복사' 방식으로만 동작합니다.
+   설치 방법은 성적수집기_AppsScript.gs 파일 맨 위를 참고하세요.
+   ──────────────────────────────────────────────── */
+const ENDPOINT = "";
+
 /* 난도별 문항 묶음 */
 const SETS = {
   basic: BASIC,
@@ -694,7 +730,8 @@ const SETS = {
 let mode = "basic";
 
 const $ = id => document.getElementById(id);
-let deck = [], idx = 0, picked = null, locked = false, log = [], t0 = 0, who = "";
+let deck = [], idx = 0, picked = null, locked = false, log = [], t0 = 0, who = "", klass = "";
+let payload = null;
 
 function shuffle(a){
   const b = a.slice();
@@ -807,10 +844,24 @@ function finish(){
   }).join("");
 
   $("copy").dataset.text =
-    `[국어의 어제와 오늘 복습 퀴즈] ${who||"이름없음"} / ${LABEL[mode]} / ${pt}점 (${right}/${deck.length}) / ` +
+    `[국어의 어제와 오늘 복습 퀴즈] ${klass ? klass+" " : ""}${who||"이름없음"} / ${LABEL[mode]} / ${pt}점 (${right}/${deck.length}) / ` +
     (wrong.length ? `오답 ${wrong.join(",")}번` : "만점") + ` / ${mm}분${ss}초`;
 
+  payload = {
+    klass: klass,
+    name: who,
+    set: LABEL[mode],
+    score: pt,
+    right: right,
+    total: deck.length,
+    seconds: sec,
+    wrong: wrong,
+    marks: log.map(r => r.ok ? "O" : "X").join(""),
+    wrongTags: deck.filter((_,i) => !log[i].ok).map(item => item.tag)
+  };
+
   show("result");
+  send();
 }
 
 const LABEL = {basic:"기본", adv:"심화", all:"전체"};
@@ -833,6 +884,7 @@ $("levels").addEventListener("click", e=>{
 
 $("start").addEventListener("click", ()=>{
   who = $("name").value.trim();
+  klass = $("klass").value.trim();
   build(); idx = 0; log = []; t0 = Date.now();
   show("quiz"); render();
 });
@@ -849,6 +901,27 @@ $("hintBtn").addEventListener("click", ()=>{
   $("hintBtn").textContent = h.hidden ? "힌트 보기" : "힌트 접기";
 });
 
+async function send(){
+  if(!ENDPOINT || !payload) return;
+  const note = $("sendNote");
+  note.hidden = false;
+  note.className = "send";
+  note.textContent = "성적을 제출하는 중입니다.";
+  $("resend").hidden = true;
+
+  try{
+    await fetch(ENDPOINT, { method:"POST", body: JSON.stringify(payload) });
+    note.className = "send ok";
+    note.textContent = "제출을 마쳤습니다. 선생님께 성적이 전달되었습니다.";
+  }catch(err){
+    note.className = "send bad";
+    note.textContent = "전송에 실패했습니다. 인터넷 연결을 확인하고 다시 제출을 눌러 주세요. 계속 안 되면 결과 복사를 눌러 단톡방에 붙여넣어 주세요.";
+    $("resend").hidden = false;
+  }
+}
+
+$("resend").addEventListener("click", send);
+
 $("copy").addEventListener("click", async ()=>{
   const text = $("copy").dataset.text || "";
   try{
@@ -860,6 +933,9 @@ $("copy").addEventListener("click", async ()=>{
 });
 
 $("again").addEventListener("click", ()=>{
+  payload = null;
+  $("sendNote").hidden = true;
+  $("resend").hidden = true;
   build(); idx = 0; log = []; t0 = Date.now();
   show("quiz"); render();
 });
